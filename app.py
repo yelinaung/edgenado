@@ -73,12 +73,16 @@ class MainHandler(tornado.web.RequestHandler):
 
     async def get(self):
         db = self.application.client
-        user_set = await db.query(
-            "SELECT Person {first_name, last_name}"
-        )
-        # *user_set* now contains
-        # Set{Object{name := 'Bob', dob := datetime.date(1984, 3, 1)}}
-        self.write(str(user_set))
+        user_set = await db.query("SELECT Person {first_name, last_name}")
+        data = [
+            {
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+            }
+            for user in user_set
+        ]
+
+        self.write_json({"data": data})
 
 
 class App(tornado.web.Application):
