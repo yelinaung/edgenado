@@ -1,62 +1,191 @@
 import json
+import random
 import asyncio
 import logging
 import signal
-import datetime
 import edgedb
 import tornado.ioloop
 import tornado.web
 import tornado.log
 
 
-class MainHandler(tornado.web.RequestHandler):
+class BaseHandler(tornado.web.RequestHandler):
+    def get_json_body(self):
+        req_body = self.request.body
+        json_req_body = None
+        try:
+            json_req_body = json.loads(req_body)
+        except ValueError:
+            self.write_json({"error": "invalid_json_body"}, status_code=400)
+            return
+
+        return json_req_body
+
     def write_json(self, obj, status_code=200):
         self.write(json.dumps(obj))
         self.set_header("Content-Type", "application/json")
         self.set_status(status_code)
         self.finish()
 
-    async def post(self):
-        req_body = self.request.body
-        json_req_body = None
-        try:
-            json_req_body = json.loads(req_body)
-        except ValueError():
-            self.write_json({"error": "invalid_json_body"}, status_code=400)
-
-        first_name = json_req_body.get("first_name")
-        last_name = json_req_body.get("last_name")
+    async def execute_query(self, query: str):
         db = self.application.client
 
-        result = None
+        import pprint
+
+        pprint.pprint(query)
         try:
-            result = await db.query(
-                """
-                INSERT Person {
-                    first_name := <str>$first_name,
-                    last_name:= <str>$last_name,
-                }
-                """,
-                first_name=first_name,
-                last_name=last_name,
-            )
+            await db.execute(query)
         except edgedb.errors.InvalidArgumentError as e:
-            self.write_json(
-                {"error": "invalid_argument", "additional_data": str(e)},
-                status_code=400,
-            )
+            # fmt: off
+            self.write_json({
+                    "error": "invalid_argument",
+                    "additional_data": str(e)
+                },
+                status_code=400)
+            # fmt: on
             return
         except edgedb.errors.InvalidValueError as e:
-            self.write_json(
-                {"error": "invalid_value", "additional_data": str(e)}, status_code=400
+            # fmt: off
+            self.write_json({
+                    "error": "invalid_value",
+                    "additional_data": str(e)
+                },
+                status_code=400)
+            # fmt: on
+            return
+        except edgedb.errors.ConstraintViolationError as e:
+            # fmt: off
+            self.write_json({
+                    "error": "constraint_violation_error",
+                    "additional_data": str(e)
+                }, status_code=400
             )
+            # fmt: on
+            return
+        except edgedb.errors.EdgeQLSyntaxError as e:
+            logging.exception("SQL Syntax error!", e)
+        except Exception as e:
+            logging.exception("Something went wrong!")
+
+    async def query_data(self, query, **kwargs):
+        db = self.application.client
+
+        try:
+            result = await db.query(query, **kwargs)
+        except edgedb.errors.InvalidArgumentError as e:
+            # fmt: off
+            self.write_json({
+                    "error": "invalid_argument",
+                    "additional_data": str(e)
+                },
+                status_code=400)
+            # fmt: on
+            return
+        except edgedb.errors.InvalidValueError as e:
+            # fmt: off
+            self.write_json({
+                    "error": "invalid_value",
+                    "additional_data": str(e)
+                },
+                status_code=400)
+            # fmt: on
             return
         except edgedb.errors.ConstraintViolationError as e:
             self.write_json(
                 {"error": "constraint_violation_error", "additional_data": str(e)},
                 status_code=400,
             )
+            # fmt: on
             return
+        except edgedb.errors.EdgeQLSyntaxError as e:
+            # fmt: off
+            self.write_json({
+                    "error": "query_error",
+                    "additional_data": str(e)
+                }, status_code=400
+            )
+            # fmt: on
+            return
+
+        return result
+
+
+# GET/POST /v1/movies
+class MoviesHandler(BaseHandler):
+    async def post(self):
+        json_req_body = self.get_json_body()
+        query = """
+        insert Movie {{
+            title := '{}',
+            year := {},
+            actors := {{ {} }}
+            }};
+        """
+
+        actors = json_req_body.get("actors", [])
+        if not actors:
+            self.write_json(
+                {
+                    "error": "require_actors",
+                },
+                status_code=400,
+            )
+            return
+
+        actor_query = ",".join(
+            f'(insert Person {{ first_name := \'{actor.get("first_name")}\', last_name := \'{actor.get("last_name")}\' }})'
+            for actor in actors
+        )
+
+        final_query = query.format(
+            json_req_body.get("movie_title"),
+            int(json_req_body.get("year")),
+            actor_query,
+        )
+
+        result = await self.execute_query(final_query)
+
+        if not result:
+            self.write_json(
+                {"error": "something_went_wrong!"},
+                status_code=400,
+            )
+            return
+
+        self.write_json(
+            {
+                "message": "user_created_successfully!",
+            }
+        )
+
+    async def get(self):
+        db = self.application.client
+        movies = await db.query("SELECT Movie { title, year, director, actors }")
+        data = [
+            {
+                "title": movie.title,
+                "year": movie.year,
+                "director": movie.director,
+            }
+            for movie in movies
+        ]
+        self.write_json({"data": data})
+
+
+# GET/POST /v1/people
+class PeopleHandler(BaseHandler):
+    async def post(self):
+        json_req_body = self.get_json_body()
+        first_name = json_req_body.get("first_name")
+        last_name = json_req_body.get("last_name")
+        query = """
+            INSERT Person {
+                first_name := <str>$first_name,
+                last_name:= <str>$last_name,
+            }
+            """
+        data = {"first_name": first_name, "last_name": last_name}
+        result = await self.query_data(query, **data)
 
         if not result:
             self.write_json(
@@ -89,9 +218,13 @@ class App(tornado.web.Application):
     def __init__(self, **kwargs):
         self.client = edgedb.create_async_client()
         routes = [
-            (r"/", MainHandler),
+            (r"/v1/people", PeopleHandler),
+            (r"/v1/movies", MoviesHandler),
         ]
-        super().__init__(routes, **kwargs)
+        settings = {
+            "debug": True,
+        }
+        super().__init__(routes, **settings)
 
     def start(self, port):
         self.server = self.listen(port)
@@ -102,7 +235,11 @@ class App(tornado.web.Application):
         logging.info("Closing database connections")
         await self.client.aclose()
 
-        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        # fmt: off
+        tasks = [
+            t for t in asyncio.all_tasks() if t is not asyncio.current_task()
+        ]
+        # fmt: on
 
         [task.cancel() for task in tasks]
 
